@@ -445,7 +445,7 @@ def detect_session_drift(
             continue
         low = later.lower()
         cand_counts: dict[str, int] = {}
-        for t in _body_tokens(later):
+        for t in _identifier_tokens(later):
             if any(t in k or k in t for k in e.keywords):
                 continue
             if t in owners:                       # belongs to another line
@@ -477,30 +477,35 @@ def detect_session_drift(
 _GLYPH = "💾"
 
 
-def summary_line(proposals: Sequence[Proposal], applied: int = 0, max_items: int = 4) -> str:
-    """One chat line, same grammar as the skill review summary. Empty when quiet."""
+def summary_line(proposals: Sequence[Proposal], max_targets: int = 3) -> str:
+    """One chat line, target-first and human, same shape as the skill review line.
+
+    "💾 Memory optimization: darkswords-project +4 keywords (192.168.0.10, …) ·
+     aklima-android-app +2 keywords (…)"  — empty string when there is nothing to say.
+    """
     if not proposals:
         return ""
-    head = f"{_GLYPH} Memory optimization:"
-    counts: dict[str, int] = {}
+    adds: dict[str, list[str]] = {}
+    drops: dict[str, list[str]] = {}
     for p in proposals:
-        counts[p.kind] = counts.get(p.kind, 0) + 1
-    order = [
-        "session-drift", "coverage-missing-keyword", "coverage-dead-keyword",
-        "orphan-file", "orphan-line", "duplicate-target", "duplicate-keyword",
-        "keyword-count",
-    ]
+        for k in p.add:
+            adds.setdefault(p.target, [])
+            if k not in adds[p.target]:
+                adds[p.target].append(k)
+        for k in p.remove:
+            drops.setdefault(p.target, []).append(k)
     bits = []
-    for kind in order:
-        if counts.get(kind):
-            bits.append(f"{counts[kind]} {kind}")
-    for kind, n in counts.items():
-        if kind not in order:
-            bits.append(f"{n} {kind}")
-    targets = [p.target for p in proposals if p.kind == "session-drift"][:2]
-    tail = f" · {' · '.join(targets)}" if targets else ""
-    applied_bit = f" · {applied} applied" if applied else ""
-    return f"{head} {', '.join(bits[:max_items])}{applied_note(applied)}{tail}"
+    for target, kws in list(adds.items())[:max_targets]:
+        shown = ", ".join(kws[:4]) + ("…" if len(kws) > 4 else "")
+        bits.append(f"{target.replace('.md', '')} +{len(kws)} keyword"
+                    f"{'s' if len(kws) != 1 else ''} ({shown})" if kws
+                    else f"{target.replace('.md', '')} keywords tightened")
+    for target, kws in list(drops.items())[:2]:
+        if kws:
+            bits.append(f"{target.replace('.md', '')} −{len(kws)} unused")
+    if not bits:
+        return ""
+    return f"\U0001F4BE Memory optimization: " + " · ".join(bits)
 
 
 def applied_note(applied: int) -> str:
@@ -532,9 +537,18 @@ def analyze(
     scope: Optional[Iterable[str]] = None,
     kinds: Optional[Iterable[str]] = None,
     db: Optional[Path] = None,
+    only: Optional[Iterable[str]] = None,
 ) -> list[Proposal]:
-    """Run the detectors. `scope` limits session/duplicate detectors to given files."""
+    """Run the detectors.
+
+    `scope` limits the session/duplicate detectors to given files.
+    `only` limits the whole pass to given files — the per-turn path uses it so the
+    cost is a few files instead of the entire store.
+    """
     lines, entries = load_index(store)
+    if only is not None:
+        keep = set(only)
+        entries = [e for e in entries if e.target in keep]
     corpus = user_corpus_tokens(db) if db else set()
     props: list[Proposal] = []
     props += detect_coverage(store, entries, corpus=corpus)

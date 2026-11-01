@@ -1226,6 +1226,50 @@ def _run_review_fork(
     st.review_agent = None
 
 
+def memory_optimization_line(agent: Any, messages: Optional[list[dict]] = None) -> str:
+    """One chat line describing keyword drift on the memory files this session touched.
+
+    Deterministic and free: no model, no network, scoped to the files the session
+    actually touched (a handful), so it costs milliseconds. Returns "" when there
+    is nothing to say — the caller must not print an empty line.
+    """
+    try:
+        from agent.memory_optimization import analyze, session_touched_files, summary_line
+        from pathlib import Path as _Path
+        home = _Path(os.environ.get("HERMES_HOME") or (_Path.home() / ".hermes"))
+        store = home / "memories"
+        if not (store / "MEMORY.md").exists():
+            return ""
+        msgs = messages if messages is not None else getattr(agent, "_session_messages", []) or []
+        touched = session_touched_files(msgs, store)
+        if not touched:
+            return ""
+        props = analyze(store, messages=msgs, scope=list(touched), only=list(touched),
+                        kinds=("session-drift", "coverage-missing-keyword",
+                               "coverage-dead-keyword", "duplicate-keyword"))
+        if not props:
+            return ""
+        return summary_line(props)
+    except Exception as exc:                      # never let this break a turn
+        logger.debug("memory optimization skipped: %s", exc)
+        return ""
+
+
+def publish_memory_optimization(agent: Any, messages: Optional[list[dict]] = None) -> None:
+    """Print the 💾 Memory optimization line once per session, after the review summary."""
+    if getattr(agent, "_memory_optimization_done", False):
+        return
+    line = memory_optimization_line(agent, messages)
+    if not line:
+        return
+    agent._memory_optimization_done = True
+    with suppress(Exception):
+        agent._safe_print(line)
+    if getattr(agent, "background_review_callback", None):
+        with suppress(Exception):
+            agent.background_review_callback(line)
+
+
 def _publish_review_summary(agent: Any, actions: list[str]) -> None:
     summary = " · ".join(dict.fromkeys(actions))
     agent._safe_print(t("display.review.summary_cli", summary=summary))
@@ -1300,6 +1344,7 @@ def _run_review_in_thread(
         _log_review_completion(st.review_usage, _classify_review_result(actions))
         if actions:
             _publish_review_summary(agent, actions)
+        publish_memory_optimization(agent, messages_snapshot)
     except Exception as e:
         logger.warning("Background memory/skill review failed: %s", e)
         if st.review_usage:
