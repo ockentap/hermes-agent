@@ -606,8 +606,22 @@ def build_refine_request(store: Path, proposals: Sequence[Proposal], limit: int 
     return REFINE_PROMPT + "\n\n".join(blocks), targets
 
 
-def parse_refine_reply(text: str, allowed_targets: Sequence[str], store: Path) -> list[Proposal]:
-    """Validate a model reply. Anything not in `allowed_targets` or the file text is dropped."""
+def parse_refine_reply(
+    text: str,
+    allowed_targets: Sequence[str],
+    store: Path,
+    justified_removals: Optional[dict[str, set[str]]] = None,
+) -> list[Proposal]:
+    """Validate a model reply. Anything not in `allowed_targets` or the file text is dropped.
+
+    Removals are only honoured when `justified_removals` says the deterministic pass
+    already flagged that exact keyword on that exact file. Measured reason: given
+    free rein, two runs independently proposed dropping `open-medivia` (the project
+    name), `patch` (from the file about local patches), and `pentest`/`audit` — the
+    words a user actually asks with. Additions were pure echoes of the candidates
+    they were handed; removals were invention. So the model may add, and may drop a
+    candidate from the add list, but it may not take words away.
+    """
     out: list[Proposal] = []
     try:
         start, end = text.find("{"), text.rfind("}")
@@ -629,11 +643,14 @@ def parse_refine_reply(text: str, allowed_targets: Sequence[str], store: Path) -
         add = [k for k in (item.get("add") or []) if isinstance(k, str) and k.strip()]
         # an addition must be traceable to the file itself
         add = [k for k in add if k.lower() in body_low][:4]
-        remove = [k for k in (item.get("remove") or []) if k in e.keywords]
+        justified = (justified_removals or {}).get(target, set())
+        remove = [k for k in (item.get("remove") or [])
+                  if k in e.keywords and k in justified]
         if not add and not remove:
             continue
         if len(e.keywords) - len(remove) + len(add) > MAX_KEYWORDS:
-            add = add[: max(0, MAX_KEYWORDS - (len(e.keywords) - len(remove)))]
+            headroom = max(0, MAX_KEYWORDS - (len(e.keywords) - len(remove)))
+            add = add[:headroom]          # trim additions, never evict existing words
         if len(e.keywords) - len(remove) + len(add) < MIN_KEYWORDS:
             continue                    # would strip the line below the format floor
         out.append(Proposal(
