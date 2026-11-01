@@ -478,34 +478,18 @@ _GLYPH = "💾"
 
 
 def summary_line(proposals: Sequence[Proposal], max_targets: int = 3) -> str:
-    """One chat line, target-first and human, same shape as the skill review line.
+    """One short chat line: "🧠 Memory optimization: 3 memories optimized".
 
-    "🧠 Memory optimization: darkswords-project +4 keywords (192.168.0.10, …) ·
-     aklima-android-app +2 keywords (…)"  — empty string when there is nothing to say.
+    The detail (which keywords, which files) belongs in the report, not the chat
+    line — a long line in every turn is noise the user stops reading.
     """
     if not proposals:
         return ""
-    adds: dict[str, list[str]] = {}
-    drops: dict[str, list[str]] = {}
-    for p in proposals:
-        for k in p.add:
-            adds.setdefault(p.target, [])
-            if k not in adds[p.target]:
-                adds[p.target].append(k)
-        for k in p.remove:
-            drops.setdefault(p.target, []).append(k)
-    bits = []
-    for target, kws in list(adds.items())[:max_targets]:
-        shown = ", ".join(kws[:4]) + ("…" if len(kws) > 4 else "")
-        bits.append(f"{target.replace('.md', '')} +{len(kws)} keyword"
-                    f"{'s' if len(kws) != 1 else ''} ({shown})" if kws
-                    else f"{target.replace('.md', '')} keywords tightened")
-    for target, kws in list(drops.items())[:2]:
-        if kws:
-            bits.append(f"{target.replace('.md', '')} −{len(kws)} unused")
-    if not bits:
+    targets = {p.target for p in proposals if p.add or p.remove}
+    n = len(targets)
+    if not n:
         return ""
-    return f"\U0001F9E0 Memory optimization: " + " · ".join(bits)
+    return f"\U0001F9E0 Memory optimization: {n} memor{'y' if n == 1 else 'ies'} optimized"
 
 
 def applied_note(applied: int) -> str:
