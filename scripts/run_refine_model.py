@@ -29,6 +29,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -51,7 +52,15 @@ def call_model(base_url: str, api_key: str, model: str, prompt: str,
     req = urllib.request.Request(
         base_url.rstrip("/") + "/chat/completions",
         data=body,
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            # Cloudflare in front of the endpoint answers bare urllib with 403/1010
+            "User-Agent": "Mozilla/5.0 (X11; Linux aarch64) hermes-bench/1.0",
+            "Accept": "application/json",
+            # the zen/go router wants a session id on every request
+            "x-opencode-session": os.environ.get("OPENCODE_SESSION") or str(uuid.uuid4()),
+        },
     )
     t0 = time.perf_counter()
     with urllib.request.urlopen(req, timeout=timeout) as resp:
