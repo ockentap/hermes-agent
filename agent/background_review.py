@@ -1256,7 +1256,7 @@ def memory_optimization_line(agent: Any, messages: Optional[list[dict]] = None) 
 
 
 def publish_memory_optimization(agent: Any, messages: Optional[list[dict]] = None) -> None:
-    """Print the 💾 Memory optimization line once per session, after the review summary."""
+    """Print the 🧠 Memory optimization line once per session, after the review summary."""
     if getattr(agent, "_memory_optimization_done", False):
         return
     line = memory_optimization_line(agent, messages)

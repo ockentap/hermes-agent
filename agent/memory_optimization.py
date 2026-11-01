@@ -480,7 +480,7 @@ _GLYPH = "💾"
 def summary_line(proposals: Sequence[Proposal], max_targets: int = 3) -> str:
     """One chat line, target-first and human, same shape as the skill review line.
 
-    "💾 Memory optimization: darkswords-project +4 keywords (192.168.0.10, …) ·
+    "🧠 Memory optimization: darkswords-project +4 keywords (192.168.0.10, …) ·
      aklima-android-app +2 keywords (…)"  — empty string when there is nothing to say.
     """
     if not proposals:
@@ -505,7 +505,7 @@ def summary_line(proposals: Sequence[Proposal], max_targets: int = 3) -> str:
             bits.append(f"{target.replace('.md', '')} −{len(kws)} unused")
     if not bits:
         return ""
-    return f"\U0001F4BE Memory optimization: " + " · ".join(bits)
+    return f"\U0001F9E0 Memory optimization: " + " · ".join(bits)
 
 
 def applied_note(applied: int) -> str:
