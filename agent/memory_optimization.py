@@ -844,6 +844,47 @@ def parse_refine_reply(
     return out
 
 
+# ------------------------------------------------------------- applying ------
+
+def apply_plan(store: Path, proposals: Sequence[Proposal]) -> list[dict]:
+    """Turn keyword proposals into the exact edits a memory-tool call can make.
+
+    MEMORY.md is write-locked for everything except the memory tool, so the applier
+    cannot be a plain file write. Each entry here is one `memory(action="patch")`:
+    `old_text` is the line's whole keyword span (unique inside the file), `new_text`
+    is the replacement span. The caller applies them and then calls
+    `record_applied()` so the provenance sidecar knows what was machine-mined.
+    """
+    _, entries = load_index(store)
+    by_target = {e.target: e for e in entries}
+    out: list[dict] = []
+    for p in proposals:
+        if p.kind not in ("unique-term", "unique-term-swap"):
+            continue
+        e = by_target.get(p.target)
+        if e is None or e.tagged:
+            continue
+        drop = [k for k in p.remove if k in e.keywords]
+        keep = [k for k in e.keywords if k not in drop]
+        add = [k for k in p.add if k not in keep]
+        new_kws = keep + add
+        if len(new_kws) < MIN_KEYWORDS or len(new_kws) > MAX_KEYWORDS:
+            continue
+        old_span = ",".join(e.keywords)
+        new_span = ",".join(new_kws)
+        if old_span == new_span:
+            continue
+        out.append({
+            "file": p.target,
+            "old_text": old_span,
+            "new_text": new_span,
+            "add": add,
+            "remove": drop,
+            "kind": p.kind,
+        })
+    return out
+
+
 # ------------------------------------------------------------------ cli -------
 
 def _load_session_messages(db: Path, session_id: str) -> list[dict]:
@@ -878,6 +919,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--summary", action="store_true", help="print the one-line chat summary")
     ap.add_argument("--kinds", help="comma-separated detector filter")
     ap.add_argument("--limit", type=int, default=0, help="cap proposals per kind (0 = all)")
+    ap.add_argument("--plan", action="store_true",
+                    help="emit memory-tool edits (old_text/new_text) for the keyword proposals")
+    ap.add_argument("--record", help="JSON: {file, add:[], remove:[]} already applied -> provenance")
+    ap.add_argument("--max-files", type=int, default=0, help="apply plan for at most N files")
     args = ap.parse_args(argv)
 
     store = Path(os.path.expanduser(args.store))
@@ -897,6 +942,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for p in props:
             buckets.setdefault(p.kind, []).append(p)
         props = [p for items in buckets.values() for p in items[: args.limit]]
+    if args.record:
+        rec = json.loads(args.record)
+        record_applied(store, rec["file"], rec.get("add") or [], rec.get("remove") or [])
+        print(f"recorded {len(rec.get('add') or [])} added / "
+              f"{len(rec.get('remove') or [])} removed for {rec['file']}")
+        return 0
+    if args.plan:
+        plan = apply_plan(store, props)
+        if args.max_files:
+            seen, capped = [], []
+            for item in plan:
+                if item["file"] not in seen:
+                    if len(seen) >= args.max_files:
+                        continue
+                    seen.append(item["file"])
+                capped.append(item)
+            plan = capped
+        print(json.dumps(plan, indent=1))
+        return 0
     if args.json:
         print(json.dumps([p.as_dict() for p in props], indent=1))
     elif args.summary:
