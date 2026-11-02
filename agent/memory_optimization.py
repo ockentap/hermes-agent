@@ -38,6 +38,7 @@ import json
 import os
 import re
 import sys
+from datetime import datetime, timezone
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence
@@ -430,15 +431,73 @@ def _doc_vocab(body: str) -> dict[str, int]:
     return counts
 
 
-def detect_unique_terms(store: Path, entries: Sequence[Entry], limit_per_file: int = 3) -> list[Proposal]:
-    """Words that live in exactly one memory file, are used repeatedly there, and are
-    on no index line.
+MAX_AUTO_KEYWORDS = 5          # hard cap per file: auto-mined keywords
+PROVENANCE_NAME = ".keyword-provenance.json"
 
-    This is the "router" case: a term specific enough to identify the file, common
-    inside it, absent from every other file. Document frequency of 1 across the store
-    is what makes it distinctive — no dictionary, no model, no idiom list needed. A
-    word like "hermes" fails on df, and a one-off mention fails on count.
+
+def provenance_path(store: Path) -> Path:
+    return store / PROVENANCE_NAME
+
+
+def load_provenance(store: Path) -> dict:
+    """{file.md: {keyword: {"source": ..., "added": ..., "score_at_add": ...}}}"""
+    try:
+        raw = json.loads(provenance_path(store).read_text())
+        return raw if isinstance(raw, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_provenance(store: Path, data: dict) -> None:
+    tmp = provenance_path(store).with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=1, sort_keys=True))
+    tmp.replace(provenance_path(store))
+
+
+def record_applied(store: Path, file_target: str, added: Sequence[str],
+                   removed: Sequence[str] = (), now: Optional[str] = None) -> None:
+    """Update the provenance sidecar after a keyword edit is actually applied.
+
+    Only this sidecar knows which keywords were machine-mined; without it the cap
+    and the swap policy have nothing to count, and a hand-written keyword would be
+    evicted in favour of a generated one.
     """
+    data = load_provenance(store)
+    ent = data.setdefault(file_target, {})
+    for k in removed:
+        ent.pop(k, None)
+    stamped = now or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for k in added:
+        ent[k] = {"source": "unique-term", "added": stamped}
+    if not ent:
+        data.pop(file_target, None)
+    save_provenance(store, data)
+
+
+def _term_score(word: str, counts: dict, body: str) -> float:
+    """Frequency, plus a bump when the term appears in the file's title/lede."""
+    score = float(counts.get(word, 0))
+    if word in _fold(body[:200]):
+        score += 5.0
+    return score
+
+
+def detect_unique_terms(store: Path, entries: Sequence[Entry],
+                        limit_per_file: int = MAX_AUTO_KEYWORDS) -> list[Proposal]:
+    """Words that identify exactly one memory file, capped at five per file.
+
+    Cap and replacement policy:
+      * at most MAX_AUTO_KEYWORDS machine-mined keywords per file at any time;
+      * the count comes from the provenance sidecar, so hand-written keywords are
+        never evicted to make room;
+      * when the file is at the cap, a stronger candidate displaces the weakest
+        tracked one — a swap (add + remove), never a sixth addition.
+
+    A word already on any index line is skipped, so "router" on the openwrt line is
+    never proposed again. Document frequency of 1 is the distinctiveness test;
+    no dictionary or model is involved.
+    """
+    cap = max(0, min(limit_per_file, MAX_AUTO_KEYWORDS))
     owners = keyword_owners(entries)
     bodies = {e.target: load_body(store, e.target) for e in entries}
     vocab = {t: _doc_vocab(b) for t, b in bodies.items() if b}
@@ -446,30 +505,64 @@ def detect_unique_terms(store: Path, entries: Sequence[Entry], limit_per_file: i
     for counts in vocab.values():
         for word in counts:
             df[word] = df.get(word, 0) + 1
+    tracked = load_provenance(store)
     out: list[Proposal] = []
+
     for e in entries:
         counts = vocab.get(e.target)
         if not counts:
             continue
+        body = bodies[e.target]
+        mine = tracked.get(e.target, {})
+        # tracked keywords still present on the line count against the cap
+        active = {k: v for k, v in mine.items() if k in e.keywords}
         cands = [
-            (word, n) for word, n in counts.items()
-            if df.get(word) == 1                 # unique to this file
-            and n >= 3                           # used repeatedly, not mentioned once
-            and word not in owners               # on no index line anywhere
-            and not any(word in k or k in word for k in e.keywords)
+            (word, _term_score(word, counts, body)) for word in counts
+            if df.get(word) == 1
+            and counts[word] >= 3
+            and word not in owners
+            and word not in e.keywords
+            and len(word) >= 5
         ]
         if not cands:
             continue
-        cands.sort(key=lambda wn: -wn[1])
-        picks = [w for w, _ in cands[:limit_per_file]]
+        cands.sort(key=lambda ws: -ws[1])
+        room = cap - len(active)
+        if room > 0:
+            picks = [w for w, _ in cands[:room]]
+            out.append(Proposal(
+                kind="unique-term",
+                target=e.target,
+                detail=(f"{len(picks)} unique word(s) added "
+                        f"({len(active)}/{cap} auto-keyword slots used)"),
+                evidence=", ".join(f"{w}({counts[w]})" for w in picks),
+                add=picks,
+                confidence=0.6,
+                auto_applicable=not e.tagged and len(e.keywords) + len(picks) <= MAX_KEYWORDS,
+            ))
+            continue
+        # at the cap: swap only if the best candidate beats the weakest tracked word
+        if not active or e.tagged:
+            continue
+        weakest = min(active, key=lambda k: (_term_score(k, counts, body),
+                                             active[k].get("added", "")[:10]))
+        best_word, best_score = cands[0]
+        weakest_score = _term_score(weakest, counts, body)
+        # Require a real margin, not a one-mention lead: swapping is churn, and a
+        # keyword that was good enough yesterday should not lose to noise.
+        if best_score < weakest_score * 1.5 + 1:
+            continue
         out.append(Proposal(
-            kind="unique-term",
+            kind="unique-term-swap",
             target=e.target,
-            detail=f"{len(cands)} word(s) unique to this file are on no index line",
-            evidence=", ".join(f"{w}(x{n})" for w, n in cands[:limit_per_file]),
-            add=picks,
-            confidence=0.6,
-            auto_applicable=not e.tagged and len(e.keywords) < MAX_KEYWORDS,
+            detail=(f"auto-keyword cap reached ({cap}/{cap}); "
+                    f"'{best_word}' ({counts.get(best_word, 0)}) outranks '{weakest}' "
+                    f"({counts.get(weakest, 0)})"),
+            evidence=f"+{best_word} -{weakest}",
+            add=[best_word],
+            remove=[weakest],
+            confidence=0.55,
+            auto_applicable=True,
         ))
     return out
 
