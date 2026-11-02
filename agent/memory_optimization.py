@@ -388,6 +388,92 @@ def detect_duplicate_keywords(entries: Sequence[Entry], scope: Optional[Iterable
     return out
 
 
+# ------------------------------------------------------ distinctive terms ----
+
+_WORD_RE = re.compile(r"[a-z][a-z0-9_./-]{3,}")
+# Words too common in English/tech prose to route anything on their own. This is
+# deliberately small: the df==1 test below is the real filter.
+_FOREIGN_STOPWORDS = {
+    # Swedish (Lav's documents), Bosnian/BCS, German, Spanish — housekeeping words
+    # that would otherwise pass as "unique" in a file written in that language.
+    "ingen", "inte", "inga", "och", "att", "som", "for", "med", "det", "den", "ar",
+    "till", "har", "kan", "om", "vi", "jag", "fran", "efter", "eller", "enligt",
+    "je", "da", "se", "na", "za", "od", "sa", "koji", "nije", "ali", "ili", "kao",
+    "kod", "pri", "kada", "ako", "samo", "biti", "ima", "nema", "treba", "mora",
+    "der", "die", "das", "und", "nicht", "eine", "einen", "auch", "wird", "sind",
+    "para", "como", "pero", "cuando", "desde", "sobre", "todo", "esta",
+}
+_GENERIC_WORDS = {
+    "this", "that", "with", "from", "have", "will", "when", "then", "than", "they",
+    "them", "there", "their", "which", "while", "what", "were", "your", "should",
+    "could", "would", "about", "after", "before", "because", "other", "into",
+    "file", "files", "line", "lines", "note", "notes", "true", "false", "none",
+    "work", "works", "working", "used", "using", "make", "made", "need", "needs",
+    "same", "only", "also", "very", "much", "more", "most", "some", "such",
+    "here", "does", "done", "each", "both", "must", "over", "under", "again",
+    "check", "checked", "value", "values", "thing", "things", "case", "cases",
+    "step", "steps", "first", "second", "last", "next", "back", "down", "up",
+}
+
+
+def _doc_vocab(body: str) -> dict[str, int]:
+    """word -> count, folded, stopwords and generic prose removed."""
+    counts: dict[str, int] = {}
+    for raw in _WORD_RE.findall(_fold(body)):
+        raw = raw.strip("._/:-")
+        if (raw in _STOPWORDS or raw in _GENERIC_WORDS
+                or raw in _FOREIGN_STOPWORDS or len(raw) < 5):
+            continue
+        if raw.isdigit():
+            continue
+        counts[raw] = counts.get(raw, 0) + 1
+    return counts
+
+
+def detect_unique_terms(store: Path, entries: Sequence[Entry], limit_per_file: int = 3) -> list[Proposal]:
+    """Words that live in exactly one memory file, are used repeatedly there, and are
+    on no index line.
+
+    This is the "router" case: a term specific enough to identify the file, common
+    inside it, absent from every other file. Document frequency of 1 across the store
+    is what makes it distinctive — no dictionary, no model, no idiom list needed. A
+    word like "hermes" fails on df, and a one-off mention fails on count.
+    """
+    owners = keyword_owners(entries)
+    bodies = {e.target: load_body(store, e.target) for e in entries}
+    vocab = {t: _doc_vocab(b) for t, b in bodies.items() if b}
+    df: dict[str, int] = {}
+    for counts in vocab.values():
+        for word in counts:
+            df[word] = df.get(word, 0) + 1
+    out: list[Proposal] = []
+    for e in entries:
+        counts = vocab.get(e.target)
+        if not counts:
+            continue
+        cands = [
+            (word, n) for word, n in counts.items()
+            if df.get(word) == 1                 # unique to this file
+            and n >= 3                           # used repeatedly, not mentioned once
+            and word not in owners               # on no index line anywhere
+            and not any(word in k or k in word for k in e.keywords)
+        ]
+        if not cands:
+            continue
+        cands.sort(key=lambda wn: -wn[1])
+        picks = [w for w, _ in cands[:limit_per_file]]
+        out.append(Proposal(
+            kind="unique-term",
+            target=e.target,
+            detail=f"{len(cands)} word(s) unique to this file are on no index line",
+            evidence=", ".join(f"{w}(x{n})" for w, n in cands[:limit_per_file]),
+            add=picks,
+            confidence=0.6,
+            auto_applicable=not e.tagged and len(e.keywords) < MAX_KEYWORDS,
+        ))
+    return out
+
+
 def detect_thin_lines(entries: Sequence[Entry]) -> list[Proposal]:
     """Lines outside the 5..20 keyword band the index format requires."""
     out = []
@@ -537,6 +623,7 @@ def analyze(
     props: list[Proposal] = []
     props += detect_coverage(store, entries, corpus=corpus)
     props += detect_orphans(store, entries, lines)
+    props += detect_unique_terms(store, entries)
     props += detect_thin_lines(entries)
     if messages:
         props += detect_session_drift(store, entries, messages)
